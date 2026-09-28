@@ -1,7 +1,7 @@
 // Service worker: guarda la app en el celular la primera vez que se abre
 // con señal, para que después funcione sin internet, incluso si pasan
 // semanas sin conexión.
-const CACHE = 'epp-cache-v2';
+const CACHE = 'epp-cache-v4';
 const FILES = ['./', './index.html', './manifest.json', './icon.svg'];
 
 self.addEventListener('install', (event)=>{

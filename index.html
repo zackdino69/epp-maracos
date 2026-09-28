@@ -401,15 +401,22 @@ function toast(msg){
 // ---------- almacenamiento local (por celular) ----------
 const RECORDS_KEY = 'epp_records_v2';
 function loadRecords(){
-  try{ records = JSON.parse(localStorage.getItem(RECORDS_KEY) || '[]'); }
-  catch(e){ records = []; }
+  // Si no se puede leer el almacenamiento, se conserva lo que hay en memoria:
+  // nunca se sobrescribe con una lista vacía por error.
+  try{
+    const raw = localStorage.getItem(RECORDS_KEY);
+    if(raw !== null) records = JSON.parse(raw);
+  }catch(e){ /* se conserva records tal como está */ }
+}
+function actualizarContador(){
+  const c = document.getElementById('histCount');
+  c.textContent = records.length;
+  c.classList.toggle('hidden', records.length===0);
 }
 function saveRecords(){
   try{ localStorage.setItem(RECORDS_KEY, JSON.stringify(records)); }
   catch(e){ toast('⚠️ No se pudo guardar — puede que la memoria del celular esté llena'); }
-  const c = document.getElementById('histCount');
-  c.textContent = records.length;
-  c.classList.toggle('hidden', records.length===0);
+  actualizarContador();
 }
 
 // ---------- encabezado recordado (por celular) ----------
@@ -686,8 +693,11 @@ function resetWorkerForm(){
 
 // ---------- envío a Power Automate con cola de reenvío ----------
 const PA_WEBHOOK_URL = 'https://defaultc30619979f9e4ad6a335e5e17e5f19.4a.environment.api.powerplatform.com:443/powerautomate/automations/direct/cu/18/workflows/cfe1bbf0e13e4c7f8df34606dde4f114/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=PWx7l4AkZL9XyJZJSF1wqLud_T6_tXVDFIWBPNdxzcI';
-const PA_TIMEOUT_MS = 45000;
+const PA_TIMEOUT_MS = 100000;          // el flujo puede tardar en contestar: no cortar antes de tiempo
+const PA_ENFRIAMIENTO_MS = 10*60*1000; // tras un "tiempo agotado", esperar 10 min antes de reintentar solo
+const PA_MAX_DUDOSOS = 2;              // tras 2 tiempos agotados, ya no se reintenta solo: pide revisar
 let enviandoPA = false;
+let enviandoId = null;   // inspección que se está enviando en este momento
 
 function generarCodigo(fecha, cedula){
   const f = (fecha||hoyISO2()).replace(/-/g,'');
@@ -703,25 +713,33 @@ function soloBase64(dataUrl){
   return idx>=0 ? dataUrl.slice(idx+1) : dataUrl;
 }
 
-// Una inspección está "pendiente" hasta que su envío sale del celular.
+// Estados de envío: "pendiente" (falta enviar), "enviado" (la petición salió) y
+// "revisar" (el flujo no contestó a tiempo varias veces: hay que mirar el Excel).
 // Las inspecciones viejas (anteriores a esta función) no tienen estado y no se envían solas.
 function estaPendiente(r){ return r.pa_estado === 'pendiente'; }
+function estaPorRevisar(r){ return r.pa_estado === 'revisar'; }
 function contarPendientes(){ return records.filter(estaPendiente).length; }
+function contarPorRevisar(){ return records.filter(estaPorRevisar).length; }
 
 function actualizarBannerPA(){
-  const n = contarPendientes();
+  const n = contarPendientes(), m = contarPorRevisar();
   const banner = document.getElementById('paBanner');
   const texto = document.getElementById('paBannerText');
-  if(n===0){ banner.classList.add('hidden'); return; }
+  if(n===0 && m===0){ banner.classList.add('hidden'); return; }
   banner.classList.remove('hidden');
-  texto.textContent = navigator.onLine
+  const partes = [];
+  if(n>0) partes.push(navigator.onLine
     ? '⏳ '+n+' inspección(es) por enviar al Excel central'
-    : '📴 Sin señal — '+n+' inspección(es) esperan para enviarse al Excel central';
+    : '📴 Sin señal — '+n+' inspección(es) esperan para enviarse');
+  if(m>0) partes.push('⚠️ '+m+' sin confirmar: revisa si están en el Excel');
+  texto.textContent = partes.join(' · ');
 }
 
 // Envío "a ciegas" (no-cors): evita el bloqueo de CORS del navegador, pero no
-// permite leer la respuesta. Devuelve true si la petición salió del celular y
-// false si falló la red (sin señal, tiempo agotado...).
+// permite leer la respuesta. Devuelve:
+//  'ok'     la petición salió y el servidor contestó
+//  'red'    falló la red (sin señal): seguro que NO llegó
+//  'tiempo' no hubo respuesta a tiempo: puede que SÍ haya llegado (no se sabe)
 async function intentarEnvioPA(record){
   const payload = {
     codigo: record.codigo,
@@ -747,47 +765,104 @@ async function intentarEnvioPA(record){
       body: JSON.stringify(payload),
       signal: ctrl.signal,
     });
-    return true;
+    return 'ok';
   }catch(e){
-    console.error('No se pudo enviar a Power Automate:', e);
-    return false;
+    console.error('Envío a Power Automate:', e);
+    return (e && e.name === 'AbortError') ? 'tiempo' : 'red';
   }finally{
     clearTimeout(timer);
   }
 }
 
-// Recorre las pendientes, de la más vieja a la más nueva. Si una falla por
-// falta de señal, se detiene y lo reintenta más tarde (al volver la señal,
-// al abrir la app, o cada minuto mientras haya pendientes).
-async function enviarPendientes(){
-  if(enviandoPA || !PA_WEBHOOK_URL) return;
-  if(!navigator.onLine){ actualizarBannerPA(); return; }
+// Una pasada por la cola, de la más vieja a la más nueva.
+//  - Sin señal ('red'): se detiene y reintenta más tarde.
+//  - Sin respuesta a tiempo ('tiempo'): NO se reenvía enseguida (podría duplicarse en el
+//    Excel), se anota, y se sigue con la siguiente para que ninguna se quede atascada.
+async function pasadaDeEnvio(manual, soloId){
+  loadRecords();   // estado más reciente (otra pestaña pudo haber enviado ya)
+  const ahora = Date.now();
   const cola = records.filter(estaPendiente)
+    .filter(r => !soloId || r.id === soloId)
+    .filter(r => manual || !r.pa_ultimo_dudoso || (ahora - r.pa_ultimo_dudoso) > PA_ENFRIAMIENTO_MS)
     .sort((a,b)=> (a.created_at||'').localeCompare(b.created_at||''));
-  if(cola.length===0){ actualizarBannerPA(); return; }
+  let enviadas = 0, dudosas = 0;
+  for(const r of cola){
+    const actual = records.find(x=>x.id===r.id);   // por si se editó o eliminó
+    if(!actual || !estaPendiente(actual)) continue;
+    enviandoId = actual.id;
+    renderHistorial();
+    const res = await intentarEnvioPA(actual);
+    enviandoId = null;
+    if(res === 'red') break;
+    const vigente = records.find(x=>x.id===r.id);
+    if(!vigente) continue;
+    if(res === 'ok'){
+      vigente.pa_estado = 'enviado';
+      vigente.pa_enviado_at = new Date().toISOString();
+      vigente.pa_dudosos = undefined;
+      vigente.pa_ultimo_dudoso = undefined;
+      enviadas++;
+    }else{
+      vigente.pa_dudosos = (vigente.pa_dudosos||0) + 1;
+      vigente.pa_ultimo_dudoso = Date.now();
+      if(vigente.pa_dudosos >= PA_MAX_DUDOSOS) vigente.pa_estado = 'revisar';
+      dudosas++;
+    }
+    saveRecords();
+  }
+  if(enviadas>0) toast('✓ '+enviadas+' inspección(es) enviada(s)');
+  else if(dudosas>0) toast('⚠️ El flujo tardó en contestar: se revisará en unos minutos');
+}
 
+async function enviarPendientes(manual, soloId){
+  if(!PA_WEBHOOK_URL) return;
+  if(enviandoPA){ if(manual) toast('Ya hay un envío en curso, espera un momento'); return; }
+  if(!navigator.onLine){
+    if(manual) toast('Sin señal: se enviará solo cuando vuelva');
+    actualizarBannerPA();
+    return;
+  }
   enviandoPA = true;
-  let enviadas = 0;
   try{
-    for(const r of cola){
-      const actual = records.find(x=>x.id===r.id);   // por si se editó o eliminó
-      if(!actual || !estaPendiente(actual)) continue;
-      const ok = await intentarEnvioPA(actual);
-      if(!ok) break;
-      const vigente = records.find(x=>x.id===r.id);
-      if(vigente){
-        vigente.pa_estado = 'enviado';
-        vigente.pa_enviado_at = new Date().toISOString();
-        enviadas++;
-        saveRecords();
-      }
+    if(typeof navigator.locks !== 'undefined' && navigator.locks.request){
+      // Con varias pestañas abiertas, solo una envía a la vez (evita duplicados).
+      await navigator.locks.request('epp-envio-pa', {ifAvailable:true}, async (lock)=>{
+        if(!lock){ if(manual) toast('Otra ventana está enviando, espera un momento'); return; }
+        await pasadaDeEnvio(manual === true, soloId);
+      });
+    }else{
+      await pasadaDeEnvio(manual === true, soloId);
     }
   }finally{
     enviandoPA = false;
+    enviandoId = null;
     actualizarBannerPA();
     renderHistorial();
   }
-  if(enviadas>0) toast('✓ '+enviadas+' inspección(es) enviada(s)');
+}
+
+// Acciones manuales sobre una inspección "sin confirmar"
+function reenviarRegistro(id){
+  const r = records.find(x=>x.id===id);
+  if(!r) return;
+  r.pa_estado = 'pendiente';
+  r.pa_dudosos = undefined;
+  r.pa_ultimo_dudoso = undefined;
+  saveRecords();
+  actualizarBannerPA();
+  renderHistorial();
+  enviarPendientes(true);
+}
+function marcarComoEnviada(id){
+  const r = records.find(x=>x.id===id);
+  if(!r) return;
+  r.pa_estado = 'enviado';
+  r.pa_enviado_at = new Date().toISOString();
+  r.pa_dudosos = undefined;
+  r.pa_ultimo_dudoso = undefined;
+  saveRecords();
+  actualizarBannerPA();
+  renderHistorial();
 }
 
 // ---------- guardar (siempre local; el envío va por la cola) ----------
@@ -828,6 +903,8 @@ function guardarTrabajador(){
     codigo: prev ? prev.codigo : generarCodigo(fechaSel, selectedCedula || ''),
     pa_estado: prev ? prev.pa_estado : 'pendiente',
     pa_enviado_at: prev ? prev.pa_enviado_at : undefined,
+    pa_dudosos: prev ? prev.pa_dudosos : undefined,
+    pa_ultimo_dudoso: prev ? prev.pa_ultimo_dudoso : undefined,
     created_at: prev ? (prev.created_at || new Date().toISOString()) : new Date().toISOString(),
     updated_at: new Date().toISOString(),
   };
@@ -905,7 +982,7 @@ function renderHistorial(){
         </div>
         ${(d.fotos_data||[]).length ? `<div class="fotos-row">${d.fotos_data.map(f=>`<img class="foto-thumb" src="${f}" alt="Foto EPP">`).join('')}</div>` : ''}
         <div class="hist-meta">Inspeccionó: ${d.inspector||'—'}</div>
-        ${d.pa_estado==='pendiente' ? '<div class="hist-badges"><span class="badge warn">⏳ Pendiente de enviar</span></div>' : d.pa_estado==='enviado' ? '<div class="hist-badges"><span class="badge ok">✓ Enviada</span></div>' : ''}
+        ${d.pa_estado==='pendiente' ? (enviandoId===d.id ? '<div class="hist-badges"><span class="badge warn">📤 Enviando…</span></div>' : '<div class="hist-badges"><span class="badge warn">⏳ Pendiente de enviar</span></div><div class="hist-actions"><button class="btn-edit" data-enviarid="'+d.id+'" type="button">↑ Enviar ahora</button></div>') : d.pa_estado==='revisar' ? '<div class="hist-badges"><span class="badge M">⚠️ Sin confirmar — revisa si está en el Excel</span></div><div class="hist-actions"><button class="btn-edit" data-reenviarid="'+d.id+'" type="button">↻ Reenviar</button><button class="btn-edit" data-okid="'+d.id+'" type="button">✓ Ya está en el Excel</button></div>' : d.pa_estado==='enviado' ? '<div class="hist-badges"><span class="badge ok">✓ Enviada</span></div>' : ''}
         ${badges ? `<div class="hist-badges">${badges}</div>` : ''}
         ${d.observaciones ? `<div class="hist-obs">"${escapeHtml(d.observaciones)}"</div>` : ''}
         <div class="sig-thumbs">
@@ -922,6 +999,15 @@ function renderHistorial(){
 
   list.querySelectorAll('[data-editid]').forEach(btn=>{
     btn.addEventListener('click', ()=> editarRegistro(btn.dataset.editid));
+  });
+  list.querySelectorAll('[data-enviarid]').forEach(btn=>{
+    btn.addEventListener('click', ()=> enviarPendientes(true, btn.dataset.enviarid));
+  });
+  list.querySelectorAll('[data-reenviarid]').forEach(btn=>{
+    btn.addEventListener('click', ()=> reenviarRegistro(btn.dataset.reenviarid));
+  });
+  list.querySelectorAll('[data-okid]').forEach(btn=>{
+    btn.addEventListener('click', ()=> marcarComoEnviada(btn.dataset.okid));
   });
   list.querySelectorAll('[data-delid]').forEach(btn=>{
     btn.addEventListener('click', ()=> eliminarRegistro(btn.dataset.delid));
@@ -941,8 +1027,8 @@ function escapeHtml(s){
 
 function eliminarRegistro(id){
   const r = records.find(x=>x.id===id);
-  const msg = (r && estaPendiente(r))
-    ? '⚠️ Esta inspección TODAVÍA NO se ha enviado al Excel central. Si la eliminas, se pierde por completo. ¿Eliminar de todas formas?'
+  const msg = (r && (estaPendiente(r) || estaPorRevisar(r)))
+    ? '⚠️ Esta inspección NO está confirmada en el Excel central. Si la eliminas, puede perderse por completo. ¿Eliminar de todas formas?'
     : '¿Eliminar esta inspección guardada en el celular? No se puede deshacer.';
   if(!confirm(msg)) return;
   records = records.filter(r=>r.id!==id);
@@ -1163,7 +1249,7 @@ function setupTabs(){
   document.getElementById('btnExport').addEventListener('click', exportarExcel);
   document.getElementById('filFecha').addEventListener('change', renderHistorial);
   document.getElementById('filTexto').addEventListener('input', renderHistorial);
-  document.getElementById('btnReenviar').addEventListener('click', enviarPendientes);
+  document.getElementById('btnReenviar').addEventListener('click', ()=> enviarPendientes(true));
 
   saveRecords(); // solo para refrescar el contador inicial
   renderHistorial();
@@ -1172,6 +1258,10 @@ function setupTabs(){
   // abrir la app, y cada minuto mientras haya alguna pendiente.
   actualizarBannerPA();
   window.addEventListener('online', ()=>{ actualizarBannerPA(); enviarPendientes(); });
+  // Si otra pestaña cambia las inspecciones, esta se actualiza (así no reenvía lo ya enviado).
+  window.addEventListener('storage', (e)=>{
+    if(e.key === RECORDS_KEY){ loadRecords(); actualizarContador(); renderHistorial(); actualizarBannerPA(); }
+  });
   window.addEventListener('offline', actualizarBannerPA);
   document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) enviarPendientes(); });
   setInterval(()=>{ if(contarPendientes()>0) enviarPendientes(); }, 60000);

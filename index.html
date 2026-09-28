@@ -81,6 +81,15 @@
     background:var(--warn-bg);color:var(--warn);font-size:11.5px;font-weight:600;
   }
 
+  .pa-banner{
+    display:flex;align-items:center;justify-content:space-between;gap:10px;
+    margin:8px 16px 0;padding:9px 12px;border-radius:10px;
+    background:var(--warn-bg);color:var(--warn);font-size:12px;font-weight:700;
+  }
+  .pa-banner button{
+    background:var(--warn);color:#fff;border:none;padding:6px 12px;border-radius:8px;
+    font-size:12px;font-weight:700;cursor:pointer;flex:none;
+  }
   .section{padding:14px 16px 4px;}
   .card{
     background:var(--card);border:1px solid var(--line);
@@ -224,13 +233,18 @@
     </div>
   </header>
 
-  <div class="local-note">📱 Todo se guarda solo en este celular. Exporta a Excel seguido y envíalo — nadie más ve estos registros hasta que los compartas tú.</div>
+  <div class="local-note">📱 Cada inspección se guarda en este celular y se envía sola al Excel central cuando hay señal. También puedes exportar a Excel desde el Historial.</div>
+
+  <div id="paBanner" class="pa-banner hidden">
+    <span id="paBannerText"></span>
+    <button type="button" id="btnReenviar">Reenviar ahora</button>
+  </div>
 
   <!-- ===================== TAB: NUEVA ===================== -->
   <div id="tab-nueva" class="section">
 
     <div id="editBanner" class="edit-banner hidden">
-      ✏️ Editando una inspección guardada
+      ✏️ Editando — si ya se envió, el Excel central no cambia
       <button type="button" id="btnCancelarEdicion">Cancelar</button>
     </div>
 
@@ -299,6 +313,7 @@
       <input type="text" id="filTexto" placeholder="Buscar nombre o cargo…">
     </div>
     <button class="btn btn-ghost" id="btnExport" style="margin-bottom:12px;">Exportar a Excel</button>
+    <p class="sig-note" style="margin:0 0 10px;">"Enviada" significa que salió de este celular hacia el flujo. La confirmación final es que la fila aparezca en el Excel central.</p>
     <div id="histList"></div>
   </div>
 
@@ -669,9 +684,10 @@ function resetWorkerForm(){
   sigPads.trabajador.clear();
 }
 
-// ---------- guardar (siempre local) ----------
-// ---------- envío a Power Automate (además del guardado local) ----------
+// ---------- envío a Power Automate con cola de reenvío ----------
 const PA_WEBHOOK_URL = 'https://defaultc30619979f9e4ad6a335e5e17e5f19.4a.environment.api.powerplatform.com:443/powerautomate/automations/direct/cu/18/workflows/cfe1bbf0e13e4c7f8df34606dde4f114/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=PWx7l4AkZL9XyJZJSF1wqLud_T6_tXVDFIWBPNdxzcI';
+const PA_TIMEOUT_MS = 45000;
+let enviandoPA = false;
 
 function generarCodigo(fecha, cedula){
   const f = (fecha||hoyISO2()).replace(/-/g,'');
@@ -687,13 +703,28 @@ function soloBase64(dataUrl){
   return idx>=0 ? dataUrl.slice(idx+1) : dataUrl;
 }
 
-// Envío "a ciegas" (no-cors): no se puede leer si Power Automate respondió bien
-// o mal, pero evita el bloqueo de CORS del navegador. Si falla, no afecta el
-// guardado local — la inspección ya quedó a salvo en el celular de todas formas.
-async function enviarAPowerAutomate(record, codigo){
-  if(!PA_WEBHOOK_URL) return;
+// Una inspección está "pendiente" hasta que su envío sale del celular.
+// Las inspecciones viejas (anteriores a esta función) no tienen estado y no se envían solas.
+function estaPendiente(r){ return r.pa_estado === 'pendiente'; }
+function contarPendientes(){ return records.filter(estaPendiente).length; }
+
+function actualizarBannerPA(){
+  const n = contarPendientes();
+  const banner = document.getElementById('paBanner');
+  const texto = document.getElementById('paBannerText');
+  if(n===0){ banner.classList.add('hidden'); return; }
+  banner.classList.remove('hidden');
+  texto.textContent = navigator.onLine
+    ? '⏳ '+n+' inspección(es) por enviar al Excel central'
+    : '📴 Sin señal — '+n+' inspección(es) esperan para enviarse al Excel central';
+}
+
+// Envío "a ciegas" (no-cors): evita el bloqueo de CORS del navegador, pero no
+// permite leer la respuesta. Devuelve true si la petición salió del celular y
+// false si falló la red (sin señal, tiempo agotado...).
+async function intentarEnvioPA(record){
   const payload = {
-    codigo,
+    codigo: record.codigo,
     fecha: record.fecha,
     inspector: record.inspector,
     rol: record.rol,
@@ -706,20 +737,60 @@ async function enviarAPowerAutomate(record, codigo){
     firma_inspector: soloBase64(record.firma_inspector_data),
     fotos: (record.fotos_data||[]).map(soloBase64),
   };
+  const ctrl = new AbortController();
+  const timer = setTimeout(()=>ctrl.abort(), PA_TIMEOUT_MS);
   try{
     await fetch(PA_WEBHOOK_URL, {
       method: 'POST',
       mode: 'no-cors',
       headers: {'Content-Type': 'text/plain'},
       body: JSON.stringify(payload),
+      signal: ctrl.signal,
     });
+    return true;
   }catch(e){
-    // Sin internet o el flujo falló: no pasa nada, la inspección ya está
-    // guardada en el celular y se puede exportar a Excel como siempre.
     console.error('No se pudo enviar a Power Automate:', e);
+    return false;
+  }finally{
+    clearTimeout(timer);
   }
 }
 
+// Recorre las pendientes, de la más vieja a la más nueva. Si una falla por
+// falta de señal, se detiene y lo reintenta más tarde (al volver la señal,
+// al abrir la app, o cada minuto mientras haya pendientes).
+async function enviarPendientes(){
+  if(enviandoPA || !PA_WEBHOOK_URL) return;
+  if(!navigator.onLine){ actualizarBannerPA(); return; }
+  const cola = records.filter(estaPendiente)
+    .sort((a,b)=> (a.created_at||'').localeCompare(b.created_at||''));
+  if(cola.length===0){ actualizarBannerPA(); return; }
+
+  enviandoPA = true;
+  let enviadas = 0;
+  try{
+    for(const r of cola){
+      const actual = records.find(x=>x.id===r.id);   // por si se editó o eliminó
+      if(!actual || !estaPendiente(actual)) continue;
+      const ok = await intentarEnvioPA(actual);
+      if(!ok) break;
+      const vigente = records.find(x=>x.id===r.id);
+      if(vigente){
+        vigente.pa_estado = 'enviado';
+        vigente.pa_enviado_at = new Date().toISOString();
+        enviadas++;
+        saveRecords();
+      }
+    }
+  }finally{
+    enviandoPA = false;
+    actualizarBannerPA();
+    renderHistorial();
+  }
+  if(enviadas>0) toast('✓ '+enviadas+' inspección(es) enviada(s)');
+}
+
+// ---------- guardar (siempre local; el envío va por la cola) ----------
 function guardarTrabajador(){
   const inspector = document.getElementById('fInspector').value.trim();
   const nombre = document.getElementById('wNombre').value.trim();
@@ -739,9 +810,11 @@ function guardarTrabajador(){
   const items = {};
   inspeccionados.forEach(([k,v])=>{ items[k] = v.v; });
 
+  const prev = editingId ? records.find(r=>r.id===editingId) : null;
+  const fechaSel = document.getElementById('fFecha').value;
   const record = {
     id: editingId || ('rec_'+Date.now()+'_'+Math.random().toString(36).slice(2,7)),
-    fecha: document.getElementById('fFecha').value,
+    fecha: fechaSel,
     inspector, rol: document.getElementById('fRol').value.trim(),
     nombre_trabajador: nombre,
     cedula: selectedCedula || '',
@@ -751,7 +824,11 @@ function guardarTrabajador(){
     firma_trabajador_data: sigPads.trabajador.toDataURL(),
     firma_inspector_data: sigPads.inspector.toDataURL(),
     fotos_data: photoDataUrls.slice(),
-    created_at: editingId ? (records.find(r=>r.id===editingId)?.created_at || new Date().toISOString()) : new Date().toISOString(),
+    // El código se genera una sola vez y se conserva: así un reintento usa el mismo código.
+    codigo: prev ? prev.codigo : generarCodigo(fechaSel, selectedCedula || ''),
+    pa_estado: prev ? prev.pa_estado : 'pendiente',
+    pa_enviado_at: prev ? prev.pa_enviado_at : undefined,
+    created_at: prev ? (prev.created_at || new Date().toISOString()) : new Date().toISOString(),
     updated_at: new Date().toISOString(),
   };
 
@@ -766,14 +843,18 @@ function guardarTrabajador(){
   }
   saveRecords();
   saveLocalHeader();
-  if(!wasEditing){
-    showRecap(record);
-    const codigo = generarCodigo(record.fecha, record.cedula);
-    enviarAPowerAutomate(record, codigo);
-  }
+  if(!wasEditing) showRecap(record);
   resetWorkerForm();
-  toast(wasEditing ? 'Cambios guardados ✓' : 'Guardado en este celular ✓ — '+record.nombre_trabajador);
+  if(wasEditing){
+    toast('Cambios guardados ✓');
+  }else{
+    toast(navigator.onLine
+      ? 'Guardado ✓ — enviando: '+record.nombre_trabajador
+      : 'Guardado ✓ — sin señal: se enviará cuando vuelva');
+  }
   renderHistorial();
+  actualizarBannerPA();
+  enviarPendientes();
 }
 
 function showRecap(record){
@@ -824,6 +905,7 @@ function renderHistorial(){
         </div>
         ${(d.fotos_data||[]).length ? `<div class="fotos-row">${d.fotos_data.map(f=>`<img class="foto-thumb" src="${f}" alt="Foto EPP">`).join('')}</div>` : ''}
         <div class="hist-meta">Inspeccionó: ${d.inspector||'—'}</div>
+        ${d.pa_estado==='pendiente' ? '<div class="hist-badges"><span class="badge warn">⏳ Pendiente de enviar</span></div>' : d.pa_estado==='enviado' ? '<div class="hist-badges"><span class="badge ok">✓ Enviada</span></div>' : ''}
         ${badges ? `<div class="hist-badges">${badges}</div>` : ''}
         ${d.observaciones ? `<div class="hist-obs">"${escapeHtml(d.observaciones)}"</div>` : ''}
         <div class="sig-thumbs">
@@ -858,10 +940,15 @@ function escapeHtml(s){
 }
 
 function eliminarRegistro(id){
-  if(!confirm('¿Eliminar esta inspección guardada en el celular? No se puede deshacer.')) return;
+  const r = records.find(x=>x.id===id);
+  const msg = (r && estaPendiente(r))
+    ? '⚠️ Esta inspección TODAVÍA NO se ha enviado al Excel central. Si la eliminas, se pierde por completo. ¿Eliminar de todas formas?'
+    : '¿Eliminar esta inspección guardada en el celular? No se puede deshacer.';
+  if(!confirm(msg)) return;
   records = records.filter(r=>r.id!==id);
   saveRecords();
   renderHistorial();
+  actualizarBannerPA();
   toast('Eliminado');
 }
 
@@ -1076,14 +1163,27 @@ function setupTabs(){
   document.getElementById('btnExport').addEventListener('click', exportarExcel);
   document.getElementById('filFecha').addEventListener('change', renderHistorial);
   document.getElementById('filTexto').addEventListener('input', renderHistorial);
+  document.getElementById('btnReenviar').addEventListener('click', enviarPendientes);
 
   saveRecords(); // solo para refrescar el contador inicial
   renderHistorial();
 
-  // Registra el service worker: de aquí en adelante la app funciona sin
-  // internet, aunque pasen días sin señal (solo necesita internet una vez
-  // para instalarse).
+  // Reenvío automático de las pendientes: al volver la señal, al volver a
+  // abrir la app, y cada minuto mientras haya alguna pendiente.
+  actualizarBannerPA();
+  window.addEventListener('online', ()=>{ actualizarBannerPA(); enviarPendientes(); });
+  window.addEventListener('offline', actualizarBannerPA);
+  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) enviarPendientes(); });
+  setInterval(()=>{ if(contarPendientes()>0) enviarPendientes(); }, 60000);
+  enviarPendientes();
+  // Service worker: la app abre y guarda sin internet tras abrirla una vez con señal.
+  // Si hay una versión nueva, se recarga sola una vez para usarla.
   if('serviceWorker' in navigator){
+    const teniaControlador = !!navigator.serviceWorker.controller;
+    let recargado = false;
+    navigator.serviceWorker.addEventListener('controllerchange', ()=>{
+      if(teniaControlador && !recargado){ recargado = true; location.reload(); }
+    });
     navigator.serviceWorker.register('./sw.js').catch(()=>{});
   }
 })();
